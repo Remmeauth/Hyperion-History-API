@@ -61,6 +61,7 @@ const schema = {
             properties: {
                 query_time: {type: 'number'},
                 last_irreversible_block: {type: 'number'},
+                total_items: {type: 'number'},
                 actions: {
                     type: 'array',
                     items: {
@@ -157,19 +158,32 @@ async function get_actions(fastify, request) {
             filterObj.push(obj);
         }
     }
-    pos = parseInt(reqBody.pos || 0, 10);
-    offset = parseInt(reqBody.offset || 20, 10);
-    let from, size;
+    pos = parseInt(request.body.pos || 0, 10);
+    offset = parseInt(request.body.offset || 0, 10);
 
-    if (pos*offset < 0) { // check if only one (pos or offset) is negative
-        // in this case offset is incorrect, assign default size (20)
-        size = 20;
+    let size = 0;
+    let from = 0;
+
+    if (pos < 0) {
+      sort_direction = 'desc';
+      if (offset < 0) {
+        size = Math.min( Math.abs(offset), maxActions)
+      }
     } else {
-        size = Math.min( Math.abs(offset), maxActions);
-        size = Math.max(size, 1); // avoid size = 0
+      sort_direction = 'asc';
+      if (offset < 0) {
+        size = Math.min( Math.abs(offset) + 1, maxActions );
+        if (pos - size < 0) {
+          from = 0;
+          size = pos - from + 1;
+        } else {
+          from = pos - size;
+        }
+      } else {
+        size = Math.min( Math.abs(offset) + 1, maxActions);
+        from = pos;
+      }
     }
-
-    from = Math.max(pos, 0);
 
     if (reqBody.sort) {
         if (reqBody.sort === 'asc' || reqBody.sort === '1') {
@@ -179,8 +193,6 @@ async function get_actions(fastify, request) {
         } else {
             return 'invalid sort direction';
         }
-    } else {
-        sort_direction = 'desc';
     }
 
     const queryStruct = {
@@ -249,11 +261,21 @@ async function get_actions(fastify, request) {
     // console.log(prettyjson.render(esOpts));
     const pResults = await Promise.all([eosjs.rpc.get_info(), elastic['search'](esOpts)]);
     const results = pResults[1];
+    const total_items = results['body']['hits']['total']['value'];
     const response = {
         actions: [],
+        total_items: total_items,
         last_irreversible_block: pResults[0].last_irreversible_block_num
     };
     const hits = results['body']['hits']['hits'];
+    var account_action_seq = from;
+
+    if (sort_direction === 'desc') {
+      account_action_seq = total_items - size + 1
+    } else if ( offset < 0 && pos < 0) {
+      account_action_seq = from + 1
+    }
+
     if (hits.length > 0) {
         let actions = hits;
         if (offset < 0) {
@@ -271,8 +293,9 @@ async function get_actions(fastify, request) {
             }
             actions = actions.slice(index);
         }
+        if (offset < 0 && pos < 0) { actions = actions.reverse() };
 
-        actions.reverse().forEach((action, index) => {
+        actions.forEach((action, index) => {
             action = action._source;
             let act = {
                 "global_action_seq": action.global_sequence,
@@ -290,6 +313,7 @@ async function get_actions(fastify, request) {
                     "block_time": action['@timestamp']
                 }
             };
+            account_action_seq = account_action_seq + 1;
             mergeActionMeta(action);
             act.action_trace.act = action.act;
             act.action_trace.act.hex_data = new Buffer.from(JSON.stringify(action.act.data)).toString('hex');
