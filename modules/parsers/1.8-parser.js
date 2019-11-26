@@ -83,8 +83,8 @@ module.exports = {
             delete action['except'];
             delete action['error_code'];
 
-            // add usage data to the first action on the transaction
-            if (action['action_ordinal'] === 1 && action['creator_action_ordinal'] === 0) {
+            // add usage data to all 0 ordinal actions
+            if (action['creator_action_ordinal'] === 0) {
                 action['cpu_usage_us'] = cpu_usage_us;
                 action['net_usage_words'] = net_usage_words;
             }
