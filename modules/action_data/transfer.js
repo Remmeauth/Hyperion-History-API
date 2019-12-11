@@ -2,17 +2,15 @@ const hyperionModule = {
     chain: "*",
     contract: '*',
     action: 'transfer',
-    parser_version: '1.8',
+    parser_version: ['1.8','1.7'],
     handler: (action) => {
         // attach action extras here
         let qtd = null;
         const data = action['act']['data'];
         if (data['quantity']) {
             qtd = data['quantity'].split(' ');
-            delete data['quantity'];
         } else if (data['value']) {
             qtd = data['value'].split(' ');
-            delete data['value'];
         }
 
         if (qtd) {

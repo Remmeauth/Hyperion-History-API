@@ -76,15 +76,14 @@ module.exports = {
             if (!action['receipt']) {
                 console.log(full_trace.status);
                 console.log(action);
-                m
             }
             action['receipt'] = action['receipt'][1];
             action['global_sequence'] = parseInt(action['receipt']['global_sequence'], 10);
             delete action['except'];
             delete action['error_code'];
 
-            // add usage data to the first action on the transaction
-            if (action['action_ordinal'] === 1 && action['creator_action_ordinal'] === 0) {
+            // add usage data to all 0 ordinal actions
+            if (action['creator_action_ordinal'] === 0) {
                 action['cpu_usage_us'] = cpu_usage_us;
                 action['net_usage_words'] = net_usage_words;
             }
@@ -121,11 +120,15 @@ module.exports = {
                     debugLog(`[WARNING] Deserialization time for block ${result['block_num']} was too high, time elapsed ${elapsedTime}ms`);
                 }
                 if (result) {
-                    process.send({
+                    const evPayload = {
                         event: 'consumed_block',
                         block_num: result['block_num'],
                         live: reading_mode
-                    });
+                    };
+                    if (block) {
+                        evPayload["producer"] = block['producer'];
+                    }
+                    process.send(evPayload);
                 } else {
                     console.log('Empty message. No block');
                     console.log(_.omit(res, ['block', 'traces', 'deltas']));

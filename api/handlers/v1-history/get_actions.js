@@ -10,7 +10,7 @@ const extendedActions = new Set(["transfer", "newaccount", "updateauth"]);
 const schema = {
     description: 'legacy get actions query',
     summary: 'get actions',
-    tags: ['history'],
+    tags: ['actions','history'],
     body: {
         type: ['object', 'string'],
         properties: {
@@ -302,6 +302,7 @@ async function get_actions(fastify, request) {
             const receipt = action.receipts[0];
             act.action_trace.receipt = receipt;
             act.action_trace.receiver = receipt.receiver;
+            act.account_action_seq = receipt['recv_sequence'];
             response.actions.push(act);
         });
     }

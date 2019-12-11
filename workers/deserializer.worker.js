@@ -89,6 +89,7 @@ async function processBlock(res, block, traces, deltas) {
         let producer = '';
         let ts = '';
         const block_num = res['this_block']['block_num'];
+        const block_ts = res['this_time'];
         if (process.env.FETCH_BLOCK === 'true') {
             if (!block) {
                 console.log(res);
@@ -135,7 +136,7 @@ async function processBlock(res, block, traces, deltas) {
 
         if (deltas && process.env.PROC_DELTAS === 'true') {
             const t1 = Date.now();
-            await processDeltas(deltas, block_num);
+            await processDeltas(deltas, block_num, block_ts);
             const elapsed_time = Date.now() - t1;
             if (elapsed_time > 10) {
                 debugLog(`[WARNING] Delta processing took ${elapsed_time}ms on block ${block_num}`);
@@ -153,23 +154,21 @@ async function processBlock(res, block, traces, deltas) {
                     const _actDataArray = [];
                     const _processedTraces = [];
                     const action_traces = transaction_trace['action_traces'];
-                    // console.log(transaction_trace['partial']);
                     const t3 = Date.now();
                     for (const action_trace of action_traces) {
                         if (action_trace[0] === 'action_trace_v0') {
                             const action = action_trace[1];
                             const trx_data = {trx_id, block_num, producer, cpu_usage_us, net_usage_words};
-                            const status = await mLoader.actionParser(common, ts, action, trx_data, _actDataArray, _processedTraces, transaction_trace);
-                            if (status) {
+                            if (await mLoader.actionParser(common, ts, action, trx_data, _actDataArray, _processedTraces, transaction_trace, null, 0)) {
                                 action_count++;
                             }
                         }
                     }
-                    const _finalTraces = [];
 
+                    const _finalTraces = [];
                     if (_processedTraces.length > 0) {
+
                         const digestMap = new Map();
-                        // console.log(`----------- TRX ${trx_id} ------------------`);
                         for (let i = 0; i < _processedTraces.length; i++) {
                             const receipt = _processedTraces[i].receipt;
                             const act_digest = receipt['act_digest'];
@@ -181,6 +180,7 @@ async function processBlock(res, block, traces, deltas) {
                                 digestMap.set(act_digest, _arr);
                             }
                         }
+
                         _processedTraces.forEach(data => {
                             const digest = data['receipt']['act_digest'];
                             if (digestMap.has(digest)) {
@@ -205,8 +205,6 @@ async function processBlock(res, block, traces, deltas) {
                                 digestMap.delete(digest);
                             }
                         });
-                        // console.log(prettyjson.render(_finalTraces));
-                        // console.log(`---------------------------------------------`);
                     }
 
                     // Submit Actions after deduplication
@@ -338,7 +336,19 @@ function extractDeltaStruct(deltas) {
     return deltaStruct;
 }
 
-async function processDeltas(deltas, block_num) {
+function pushToDeltaQueue(bufferdata) {
+    const q = index_queue_prefix + "_deltas:" + (delta_emit_idx);
+    preIndexingQueue.push({
+        queue: q,
+        content: bufferdata
+    });
+    delta_emit_idx++;
+    if (delta_emit_idx > (n_ingestors_per_queue * action_indexing_ratio)) {
+        delta_emit_idx = 1;
+    }
+}
+
+async function processDeltas(deltas, block_num, block_ts) {
     const deltaStruct = extractDeltaStruct(deltas);
 
     // if (Object.keys(deltaStruct).length > 4) {
@@ -362,6 +372,9 @@ async function processDeltas(deltas, block_num) {
                         block: block_num,
                         abi: jsonABIString
                     };
+                    if (process.env.PATCHED_SHIP === 'true') {
+                        new_abi_object['@timestamp'] = block_ts;
+                    }
                     debugLog(`[Worker ${process.env.worker_id}] read ${account['name']} ABI at block ${block_num}`);
                     const q = index_queue_prefix + "_abis:1";
                     preIndexingQueue.push({
@@ -397,44 +410,86 @@ async function processDeltas(deltas, block_num) {
         // Contract Rows
         if (deltaStruct['contract_row']) {
             const rows = deltaStruct['contract_row'];
+            const actionDeltaMap = {};
             for (const row of rows) {
                 const sb = createSerialBuffer(row.data);
                 try {
-                    const payload = {
-                        present: row.present,
-                        version: sb.get(),
-                        code: sb.getName(),
-                        scope: sb.getName(),
-                        table: sb.getName(),
-                        primary_key: sb.getUint64AsNumber(),
-                        payer: sb.getName(),
-                        value: sb.getBytes()
-                    };
-                    if (process.env.INDEX_ALL_DELTAS === 'true' || (payload.code === system_domain || payload.table === 'accounts')) {
+                    const payload = {};
+                    payload['present'] = row.present;
+                    payload['block_num'] = block_num;
+
+                    // deserialize action data
+                    sb.get();
+                    payload['code'] = sb.getName();
+                    payload['scope'] = sb.getName();
+                    payload['table'] = sb.getName();
+                    payload['primary_key'] = sb.getUint64AsNumber();
+                    payload['payer'] = sb.getName();
+                    if (process.env.PATCHED_SHIP === 'true') {
+                        payload['global_sequence'] = sb.getUint64AsNumber();
+                        payload["@timestamp"] = block_ts;
+                    }
+                    payload['value'] = sb.getBytes();
+
+                    // if (!contractRowObject.code) {
+                    //     contractRowObject.code = payload['code'];
+                    // } else {
+                    //     if (contractRowObject.code !== payload['code']) {
+                    //         console.log(contractRowObject.code, payload['code']);
+                    //     }
+                    // }
+
+                    if (process.env.INDEX_ALL_DELTAS === 'true' || (payload.code === 'eosio' || payload.table === 'accounts')) {
+                        // const gs = payload['global_sequence'];
                         const jsonRow = await processContractRow(payload, block_num);
                         if (jsonRow['data']) {
-                            await processTableDelta(jsonRow, block_num);
-                        }
 
-                        // if (!payload.present && payload.code === 'eosio.msig') {
-                        //     console.log(block_num, jsonRow);
-                        // }
+                            // check for specific deltas to be indexed
+                            const indexableData = await processTableDelta(jsonRow, block_num);
+                            if (indexableData) {
+                                if (process.env.ENABLE_INDEXING === 'true' && process.env.INDEX_DELTAS === 'true') {
+                                    const payload = Buffer.from(JSON.stringify(jsonRow));
+                                    pushToDeltaQueue(payload);
+                                    if (allowStreaming && process.env.STREAM_DELTAS === 'true') {
+                                        ch.publish('', queue_prefix + ':stream', payload, {
+                                            headers: {
+                                                event: 'delta',
+                                                code: jsonRow.code,
+                                                table: jsonRow.table
+                                            }
+                                        });
+                                    }
+                                    // if (process.env.PATCHED_SHIP === 'true') {
+                                    //     if (!actionDeltaMap[gs]) {
+                                    //         actionDeltaMap[gs] = {
+                                    //             "@timestamp": block_ts,
+                                    //             global_sequence: gs,
+                                    //             block_num: block_num,
+                                    //             code: payload['code'],
+                                    //             delta: [_.omit(jsonRow, ['code'])]
+                                    //         };
+                                    //     } else {
+                                    //         actionDeltaMap[gs].delta.push(_.omit(jsonRow, ['code']));
+                                    //     }
+                                    // } else {
+                                    //     pushToDeltaQueue(payload);
+                                    // }
 
-                        if (allowStreaming && process.env.STREAM_DELTAS === 'true') {
-                            const payload = Buffer.from(JSON.stringify(jsonRow));
-                            ch.publish('', queue_prefix + ':stream', payload, {
-                                headers: {
-                                    event: 'delta',
-                                    code: jsonRow.code,
-                                    table: jsonRow.table
                                 }
-                            });
+                            }
                         }
                     }
                 } catch (e) {
                     console.log(block_num, e);
                 }
             }
+
+            // for (const key of Object.keys(actionDeltaMap)) {
+            //
+            //     console.log(actionDeltaMap[key]);
+            //
+            // }
+
         }
 
         // TODO: store permission links on a dedicated index
@@ -823,11 +878,10 @@ async function storeAccount(data) {
     }
 }
 
-async function processTableDelta(data, block_num) {
+async function processTableDelta(data) {
     if (data['table']) {
-        data['block_num'] = block_num;
         data['primary_key'] = String(data['primary_key']);
-        let allowIndex = true;
+        let allowIndex;
         let handled = false;
         const key = `${data.code}:${data.table}`;
         if (tableHandlers[key]) {
@@ -844,20 +898,8 @@ async function processTableDelta(data, block_num) {
         }
         if (!handled && process.env.INDEX_ALL_DELTAS === 'true') {
             allowIndex = true;
-        } else if (handled) {
-            allowIndex = true;
-        }
-        if (process.env.ENABLE_INDEXING === 'true' && allowIndex && process.env.INDEX_DELTAS === 'true') {
-            const q = index_queue_prefix + "_deltas:" + (delta_emit_idx);
-            preIndexingQueue.push({
-                queue: q,
-                content: Buffer.from(JSON.stringify(data))
-            });
-            delta_emit_idx++;
-            if (delta_emit_idx > (n_ingestors_per_queue * action_indexing_ratio)) {
-                delta_emit_idx = 1;
-            }
-        }
+        } else allowIndex = handled;
+        return allowIndex;
     }
 }
 

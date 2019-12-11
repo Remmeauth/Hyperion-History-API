@@ -1,30 +1,43 @@
+const shards = 2;
+const replicas = 0;
+const refresh = "1s";
+const chain = process.env.CHAIN;
+const defaultLifecyclePolicy = "50G30D";
+
+const ILPs = require('./lifecycle_policies').ILPs;
+
+// LZ4 Compression
+const compression = 'default';
+// DEFLATE
+// const compression = "best_compression";
+
 const action = {
-    "order": 0,
-    "index_patterns": [
-        process.env.CHAIN + "-action-*"
+    order: 0,
+    index_patterns: [
+        chain + "-action-*"
     ],
-    "settings": {
-        "index": {
-            "lifecycle": {
-                "name": "50G30D",
-                "rollover_alias": process.env.CHAIN + "-action"
+    settings: {
+        index: {
+            lifecycle: {
+                "name": defaultLifecyclePolicy,
+                "rollover_alias": chain + "-action"
             },
-            "codec": "best_compression",
-            "refresh_interval": "10s",
-            "number_of_shards": "4",
-            "number_of_replicas": "0",
-            "sort": {
-                "field": "global_sequence",
-                "order": "desc"
+            codec: compression,
+            refresh_interval: refresh,
+            number_of_shards: shards * 2,
+            number_of_replicas: replicas,
+            sort: {
+                field: "global_sequence",
+                order: "desc"
             }
         }
     },
-    "mappings": {
-        "properties": {
+    mappings: {
+        properties: {
             "@timestamp": {"type": "date"},
             "global_sequence": {"type": "long"},
-            "account_ram_deltas.delta": {"enabled": false},
-            "account_ram_deltas.account": {"enabled": false},
+            "account_ram_deltas.delta": {"type": "integer"},
+            "account_ram_deltas.account": {"type": "keyword"},
             "act.authorization.permission": {"enabled": false},
             "act.authorization.actor": {"type": "keyword"},
             "act.account": {"type": "keyword"},
@@ -47,7 +60,7 @@ const action = {
                     "auth_sequence": {
                         "properties": {
                             "account": {"type": "keyword"},
-                            "sequence": {"type": "integer"}
+                            "sequence": {"type": "long"}
                         }
                     }
                 }
@@ -126,17 +139,18 @@ const action = {
 };
 
 const abi = {
-    "index_patterns": [process.env.CHAIN + "-abi-*"],
+    "index_patterns": [chain + "-abi-*"],
     "settings": {
         "index": {
-            "number_of_shards": 1,
-            "refresh_interval": "10s",
-            "number_of_replicas": 0
-        },
-        "index.codec": "best_compression"
+            "number_of_shards": shards,
+            "refresh_interval": refresh,
+            "number_of_replicas": replicas,
+            "codec": compression
+        }
     },
     "mappings": {
         "properties": {
+            "@timestamp": {"type": "date"},
             "block": {"type": "long"},
             "account": {"type": "keyword"},
             "abi": {"enabled": false}
@@ -145,25 +159,25 @@ const abi = {
 };
 
 const block = {
-    "index_patterns": [process.env.CHAIN + "-block-*"],
+    "index_patterns": [chain + "-block-*"],
     "settings": {
         "index": {
-            "number_of_shards": 2,
-            "refresh_interval": "5s",
-            "number_of_replicas": 0,
+            "codec": compression,
+            "number_of_shards": shards,
+            "refresh_interval": refresh,
+            "number_of_replicas": replicas,
             "sort.field": "block_num",
             "sort.order": "desc"
-        },
-        "index.codec": "best_compression"
+        }
     },
     "mappings": {
         "properties": {
+            "@timestamp": {"type": "date"},
             "block_num": {"type": "long"},
             "producer": {"type": "keyword"},
             "new_producers.producers.block_signing_key": {"enabled": false},
             "new_producers.producers.producer_name": {"type": "keyword"},
             "new_producers.version": {"type": "long"},
-            "@timestamp": {"type": "date"},
             "schedule_version": {"type": "double"},
             "cpu_usage": {"type": "integer"},
             "net_usage": {"type": "integer"}
@@ -172,12 +186,13 @@ const block = {
 };
 
 const tableProposals = {
-    "index_patterns": [process.env.CHAIN + "-table-proposals-*"],
+    "index_patterns": [chain + "-table-proposals-*"],
     "settings": {
         "index": {
-            "number_of_shards": 3,
-            "refresh_interval": "5s",
-            "number_of_replicas": 0,
+            "codec": compression,
+            "number_of_shards": shards,
+            "refresh_interval": refresh,
+            "number_of_replicas": replicas,
             "sort.field": "block_num",
             "sort.order": "desc"
         }
@@ -194,12 +209,13 @@ const tableProposals = {
 };
 
 const tableAccounts = {
-    "index_patterns": [process.env.CHAIN + "-table-accounts-*"],
+    "index_patterns": [chain + "-table-accounts-*"],
     "settings": {
         "index": {
-            "number_of_shards": 3,
-            "refresh_interval": "5s",
-            "number_of_replicas": 0,
+            "codec": compression,
+            "number_of_shards": shards,
+            "refresh_interval": refresh,
+            "number_of_replicas": replicas,
             "sort.field": "amount",
             "sort.order": "desc"
         }
@@ -217,12 +233,13 @@ const tableAccounts = {
 };
 
 const tableUserRes = {
-    "index_patterns": [process.env.CHAIN + "-table-userres-*"],
+    "index_patterns": [chain + "-table-userres-*"],
     "settings": {
         "index": {
-            "number_of_shards": 3,
-            "refresh_interval": "5s",
-            "number_of_replicas": 0,
+            "codec": compression,
+            "number_of_shards": shards,
+            "refresh_interval": refresh,
+            "number_of_replicas": replicas,
             "sort.field": "total_weight",
             "sort.order": "desc"
         }
@@ -241,12 +258,13 @@ const tableUserRes = {
 };
 
 const tableDelBand = {
-    "index_patterns": [process.env.CHAIN + "-table-delband-*"],
+    "index_patterns": [chain + "-table-delband-*"],
     "settings": {
         "index": {
-            "number_of_shards": 3,
-            "refresh_interval": "5s",
-            "number_of_replicas": 0,
+            "codec": compression,
+            "number_of_shards": shards,
+            "refresh_interval": refresh,
+            "number_of_replicas": replicas,
             "sort.field": "total_weight",
             "sort.order": "desc"
         }
@@ -265,12 +283,13 @@ const tableDelBand = {
 };
 
 const tableVoters = {
-    "index_patterns": [process.env.CHAIN + "-table-voters-*"],
+    "index_patterns": [chain + "-table-voters-*"],
     "settings": {
         "index": {
-            "number_of_shards": 3,
-            "refresh_interval": "5s",
-            "number_of_replicas": 0,
+            "codec": compression,
+            "number_of_shards": shards,
+            "refresh_interval": refresh,
+            "number_of_replicas": replicas,
             "sort.field": "last_vote_weight",
             "sort.order": "desc"
         }
@@ -291,30 +310,30 @@ const tableVoters = {
 };
 
 const delta = {
-    "index_patterns": [process.env.CHAIN + "-delta-*"],
+    "index_patterns": [chain + "-delta-*"],
     "settings": {
         "index": {
             "lifecycle": {
-                "name": "50G30D",
-                "rollover_alias": process.env.CHAIN + "-delta"
+                "name": defaultLifecyclePolicy,
+                "rollover_alias": chain + "-delta"
             },
-            "number_of_shards": 2,
-            "refresh_interval": "5s",
-            "number_of_replicas": 0,
-            "sort.field": "block_num",
-            "sort.order": "desc"
-        },
-        "index.codec": "best_compression"
+            "codec": compression,
+            "number_of_shards": shards * 2,
+            "refresh_interval": refresh,
+            "number_of_replicas": replicas
+        }
     },
     "mappings": {
         "properties": {
+            // "global_sequence": {"type": "long"},
+            // "@timestamp": {"type": "date"},
             "block_num": {"type": "long"},
-            "present": {"type": "boolean"},
+            "data": {"enabled": false},
             "code": {"type": "keyword"},
+            "present": {"type": "boolean"},
             "scope": {"type": "keyword"},
             "table": {"type": "keyword"},
             "payer": {"type": "keyword"},
-            "data": {"enabled": false},
             "primary_key": {"type": "keyword"},
             "@approvals.proposal_name": {"type": "keyword"},
             "@approvals.provided_approvals": {"type": "object"},
@@ -349,7 +368,7 @@ const delta = {
 };
 
 module.exports = {
-    action, block, abi, delta,
+    action, block, abi, delta, ILPs,
     "table-proposals": tableProposals,
     "table-accounts": tableAccounts,
     "table-delband": tableDelBand,
