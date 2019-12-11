@@ -1,5 +1,6 @@
 const cluster = require('cluster');
 const fs = require('fs');
+const path = require('path');
 const pm2io = require('@pm2/io');
 const {promisify} = require('util');
 const doctor = require('./modules/doctor');
@@ -19,47 +20,148 @@ const {
     onSaveAbi
 } = require("./helpers/functions");
 
+// Master proc globals
 let client, rClient, rpc;
 let cachedInitABI = null;
-
 const missingRanges = [];
+let currentSchedule;
+let lastProducer = null;
+const producedBlocks = {};
+let handoffCounter = 0;
+let lastProducedBlockNum = 0;
+const missedRounds = {};
+let dsErrorStream;
+let abiCacheMap;
 
-async function main() {
-    // Preview mode - prints only the proposed worker map
-    let preview = process.env.PREVIEW === 'true';
-    const queue_prefix = process.env.CHAIN;
-    if (process.env.PURGE_QUEUES === 'true') {
-        if (process.env.DISABLE_READING === 'true') {
-            console.log('Conflict between PURGE_QUEUES and DISABLE_READING');
-            process.exit(1);
+async function getCurrentSchedule() {
+    currentSchedule = await rpc.get_producer_schedule();
+}
+
+async function reportMissedBlocks(producer, last_block, size) {
+    console.log(`${producer} missed ${size} ${size === 1 ? "block" : "blocks"} after ${last_block}`);
+    await client.index({
+        index: process.env.CHAIN + '-logs',
+        body: {
+            type: 'missed_blocks',
+            '@timestamp': new Date().toISOString(),
+            'missed_blocks': {
+                'producer': producer,
+                'last_block': last_block,
+                'size': size,
+                'schedule_version': currentSchedule.schedule_version
+            }
+        }
+    });
+}
+
+let blockMsgQueue = [];
+
+function onLiveBlock(msg) {
+
+    if (msg.block_num === lastProducedBlockNum + 1 || lastProducedBlockNum === 0) {
+        const prod = msg.producer;
+
+        if (process.env.BP_LOGS === 'true') {
+            console.log(`Received block ${msg.block_num} from ${prod}`);
+        }
+        if (producedBlocks[prod]) {
+            producedBlocks[prod]++;
         } else {
-            await manager.purgeQueues(queue_prefix);
+            producedBlocks[prod] = 1;
+        }
+        if (lastProducer !== prod) {
+            handoffCounter++;
+            if (lastProducer && handoffCounter > 2) {
+                const activeProds = currentSchedule.active.producers;
+                const newIdx = activeProds.findIndex(p => p['producer_name'] === prod) + 1;
+                const oldIdx = activeProds.findIndex(p => p['producer_name'] === lastProducer) + 1;
+                if ((newIdx === oldIdx + 1) || (newIdx === 1 && oldIdx === activeProds.length)) {
+                    // Normal operation
+                    if (process.env.BP_LOGS === 'true') {
+                        console.log(`[${msg.block_num}] producer handoff: ${lastProducer} [${oldIdx}] -> ${prod} [${newIdx}]`);
+                    }
+                } else {
+                    let cIdx = oldIdx + 1;
+                    while (cIdx !== newIdx) {
+                        try {
+                            if (activeProds[cIdx - 1]) {
+                                const missingProd = activeProds[cIdx - 1]['producer_name'];
+                                // report
+                                reportMissedBlocks(missingProd, lastProducedBlockNum, 12)
+                                    .catch(console.log);
+                                // count missed
+                                if (missedRounds[missingProd]) {
+                                    missedRounds[missingProd]++;
+                                } else {
+                                    missedRounds[missingProd] = 1;
+                                }
+                                console.log(`${missingProd} missed a round [${missedRounds[missingProd]}]`);
+                            }
+                        } catch (e) {
+                            console.log(activeProds);
+                            console.log(e);
+                        }
+                        cIdx++;
+                        if (cIdx === activeProds.length) {
+                            cIdx = 0;
+                        }
+                    }
+                }
+                if (producedBlocks[lastProducer]) {
+                    if (producedBlocks[lastProducer] < 12) {
+                        const _size = 12 - producedBlocks[lastProducer];
+                        reportMissedBlocks(lastProducer, lastProducedBlockNum, _size)
+                            .catch(console.log)
+                    }
+                }
+                producedBlocks[lastProducer] = 0;
+            }
+            lastProducer = prod;
+        }
+        lastProducedBlockNum = msg.block_num;
+    } else {
+        blockMsgQueue.push(msg);
+        blockMsgQueue.sort((a, b) => a.block_num - b.block_num);
+        while (blockMsgQueue.length > 0) {
+            if (blockMsgQueue[0].block_num === lastProducedBlockNum + 1) {
+                onLiveBlock(blockMsgQueue.shift());
+            } else {
+                break;
+            }
         }
     }
+}
 
-    rpc = manager.nodeosJsonRPC;
-    rClient = manager.redisClient;
-    client = manager.elasticsearchClient;
+function setupDSElogs(starting_block, head) {
+    const logPath = './logs/' + process.env.CHAIN;
+    if (!fs.existsSync(logPath)) fs.mkdirSync(logPath, {recursive: true});
+    const dsLogFileName = (new Date().toISOString()) + "_ds_err_" + starting_block + "_" + head + ".log";
+    const dsErrorsLog = logPath + '/' + dsLogFileName;
+    if (fs.existsSync(dsErrorsLog)) fs.unlinkSync(dsErrorsLog);
+    const symbolicLink = logPath + '/deserialization_errors.log';
+    if (fs.existsSync(symbolicLink)) fs.unlinkSync(symbolicLink);
+    fs.symlinkSync(dsLogFileName, symbolicLink);
+    dsErrorStream = fs.createWriteStream(dsErrorsLog, {flags: 'a'});
+    console.log(`Deserialization errors are being logged in: ${path.join(__dirname, symbolicLink)}`);
+}
 
-    const getAsync = promisify(rClient.get).bind(rClient);
-
-    const n_deserializers = parseInt(process.env.DESERIALIZERS, 10);
-    const n_ingestors_per_queue = parseInt(process.env.ES_IDX_QUEUES, 10);
-    const action_indexing_ratio = parseInt(process.env.ES_AD_IDX_QUEUES, 10);
-
-    let max_readers = parseInt(process.env.READERS, 10);
-    if (process.env.DISABLE_READING === 'true') {
-        // Create a single reader to read the abi struct and quit.
-        max_readers = 1;
+async function initAbiCacheMap(getAsync) {
+    const cachedMap = await getAsync(process.env.CHAIN + ":" + 'abi_cache');
+    if (cachedMap) {
+        abiCacheMap = JSON.parse(cachedMap);
+        console.log(`Found ${Object.keys(abiCacheMap).length} entries in the local ABI cache`)
+    } else {
+        abiCacheMap = {};
     }
 
-    const {index_queues} = require('./definitions/index-queues');
+    // Periodically save the current map
+    setInterval(() => {
+        rClient.set(process.env.CHAIN + ":" + 'abi_cache', JSON.stringify(abiCacheMap));
+    }, 10000);
+}
 
-    const indicesList = ["action", "block", "abi", "delta"];
-
-    const index_queue_prefix = queue_prefix + ':index';
-
-    const script_status = await client.putScript({
+async function applyUpdateScript(esClient) {
+    const script_status = await esClient.putScript({
         id: "updateByBlock",
         body: {
             script: {
@@ -89,14 +191,17 @@ async function main() {
             }
         }
     });
-
     if (!script_status['body']['acknowledged']) {
         console.log('Failed to load script updateByBlock. Aborting!');
         process.exit(1);
     } else {
-        console.log('Script loaded!');
+        console.log('Painless Update Script loaded!');
     }
+}
 
+function addStateTables(indicesList, index_queues) {
+    const queue_prefix = process.env.CHAIN;
+    const index_queue_prefix = queue_prefix + ':index';
     // Optional state tables
     if (process.env.PROPOSAL_STATE === 'true') {
         indicesList.push("table-proposals");
@@ -122,8 +227,137 @@ async function main() {
         indicesList.push("table-userres");
         index_queues.push({type: 'table-userres', name: index_queue_prefix + "_table_userres"});
     }
+}
+
+async function waitForLaunch() {
+    return new Promise(resolve => {
+        console.log(`Use "pm2 trigger ${pm2io.getConfig().module_name} start" to start the indexer now or restart without preview mode.`);
+        const idleTimeout = setTimeout(() => {
+            console.log('No command received after 10 minutes.');
+            console.log('Exiting now! Disable the PREVIEW mode to continue.');
+            process.exit(1);
+        }, 60000 * 10);
+        pm2io.action('start', (reply) => {
+            resolve();
+            reply({ack: true});
+            clearTimeout(idleTimeout);
+        });
+    });
+}
+
+async function main() {
+
+    console.log(`--------- Hyperion Indexer ${require('./package').version} ---------`);
+
+    console.log(`Using parser version ${process.env.PARSER}`);
+    console.log(`Chain: ${process.env.CHAIN}`);
+
+    if (process.env.ABI_CACHE_MODE === 'true') {
+        console.log('--------\n ABI CACHING MODE \n ---------');
+    }
+
+    // Preview mode - prints only the proposed worker map
+    let preview = process.env.PREVIEW === 'true';
+    const queue_prefix = process.env.CHAIN;
+
+    // Purge queues
+    if (process.env.PURGE_QUEUES === 'true') {
+        if (process.env.DISABLE_READING === 'true') {
+            console.log('Conflict between PURGE_QUEUES and DISABLE_READING');
+            process.exit(1);
+        } else {
+            await manager.purgeQueues(queue_prefix);
+        }
+    }
+
+    // Chain API
+    rpc = manager.nodeosJsonRPC;
+    await getCurrentSchedule();
+
+    // Redis
+    rClient = manager.redisClient;
+    const getAsync = promisify(rClient.get).bind(rClient);
+
+    // ELasticsearch
+    client = manager.elasticsearchClient;
+    let ingestClients = manager.ingestClients;
+
+    // Check for ingestion nodes
+    for (const ingestClient of ingestClients) {
+        try {
+            const ping_response = await ingestClient.ping();
+            if (ping_response.body) {
+                console.log(`Ingest client ready at ${ping_response.meta.connection.id}`);
+            }
+        } catch (e) {
+            console.log(e);
+            console.log('Failed to connect to one of the ingestion nodes. Please verify the connections.json file');
+            process.exit(1);
+        }
+    }
+    ingestClients = null;
+
+    const n_deserializers = parseInt(process.env.DESERIALIZERS, 10);
+    const n_ingestors_per_queue = parseInt(process.env.ES_IDX_QUEUES, 10);
+    const action_indexing_ratio = parseInt(process.env.ES_AD_IDX_QUEUES, 10);
+
+    let max_readers = parseInt(process.env.READERS, 10);
+    if (process.env.DISABLE_READING === 'true') {
+        // Create a single reader to read the abi struct and quit.
+        max_readers = 1;
+    }
+
+    const {index_queues} = require('./definitions/index-queues');
+
+    const indicesList = ["action", "block", "abi", "delta"];
+
+    addStateTables(indicesList, index_queues);
+
+    await applyUpdateScript(client);
 
     const indexConfig = require('./definitions/mappings');
+
+    // Add lifecycle policy
+    if (indexConfig.ILPs) {
+        // check for existing policy
+        for (const ILP of indexConfig.ILPs) {
+            try {
+                await client.ilm.getLifecycle({
+                    policy: ILP.policy
+                });
+            } catch (e) {
+                console.log(e);
+                try {
+                    const ilm_status = await client.ilm.putLifecycle(ILP);
+                    if (!ilm_status['body']['acknowledged']) {
+                        console.log(`Failed to create ILM Policy`);
+                    }
+                } catch (e) {
+                    console.log(`[FATAL] :: Failed to create ILM Policy`);
+                    console.log(e);
+                    process.exit(1);
+                }
+            }
+        }
+    }
+
+    // Check for extra mappings
+    // Load Modules
+    const HyperionModuleLoader = require('./modules/index').HyperionModuleLoader;
+    const mLoader = new HyperionModuleLoader(process.env.PARSER);
+
+    // Modify mappings
+    for (const exM of mLoader.extraMappings) {
+        if (exM['action']) {
+            for (const key in exM['action']) {
+                if (exM['action'].hasOwnProperty(key)) {
+                    indexConfig['action']['mappings']['properties'][key] = exM['action'][key];
+                    console.log(`Mapping added for ${key}`);
+                }
+            }
+        }
+    }
+
 
     // Update index templates
     for (const index of indicesList) {
@@ -140,9 +374,9 @@ async function main() {
             process.exit(1);
         }
     }
-
     console.log('Index templates updated');
 
+    // Create indices
     if (process.env.CREATE_INDICES !== 'false' && process.env.CREATE_INDICES) {
         // Create indices
         let version;
@@ -166,8 +400,6 @@ async function main() {
                     index: new_index,
                     name: `${queue_prefix}-${index}`
                 });
-            } else {
-                console.log(`Index ${new_index} already created!`);
             }
         }
     }
@@ -185,6 +417,193 @@ async function main() {
 
     const workerMap = [];
     let worker_index = 0;
+    let allowShutdown = false;
+    let allowMoreReaders = true;
+    let total_range = 0;
+    let maxBatchSize = parseInt(process.env.BATCH_SIZE, 10);
+
+    // Auto-stop
+    let auto_stop = 0;
+    let idle_count = 0;
+    if (process.env.AUTO_STOP) {
+        auto_stop = parseInt(process.env.AUTO_STOP, 10);
+    }
+
+    let lastIndexedBlock;
+    if (process.env.INDEX_DELTAS === 'true') {
+        lastIndexedBlock = await getLastIndexedBlockByDelta(client);
+        console.log('Last indexed block (deltas):', lastIndexedBlock);
+    } else {
+        lastIndexedBlock = await getLastIndexedBlock(client);
+        console.log('Last indexed block (blocks):', lastIndexedBlock);
+    }
+
+    // Start from the last indexed block
+    let starting_block = 1;
+
+    // Fecth chain lib
+    const chain_data = await rpc.get_info();
+    let head = chain_data['head_block_num'];
+
+    if (lastIndexedBlock > 0) {
+        starting_block = lastIndexedBlock;
+    }
+
+    if (process.env.STOP_ON !== "0") {
+        head = parseInt(process.env.STOP_ON, 10);
+    }
+
+    let lastIndexedABI = await getLastIndexedABI(client);
+    console.log(`Last indexed ABI: ${lastIndexedABI}`);
+    if (process.env.ABI_CACHE_MODE === 'true') {
+        starting_block = lastIndexedABI;
+    }
+
+    // Define block range
+    if (process.env.START_ON !== "0") {
+        starting_block = parseInt(process.env.START_ON, 10);
+        // Check last indexed block again
+        if (process.env.REWRITE !== 'true') {
+            let lastIndexedBlockOnRange;
+            if (process.env.INDEX_DELTAS === 'true') {
+                lastIndexedBlockOnRange = await getLastIndexedBlockByDeltaFromRange(client, starting_block, head);
+            } else {
+                lastIndexedBlockOnRange = await getLastIndexedBlockFromRange(client, starting_block, head);
+            }
+            if (lastIndexedBlockOnRange > starting_block) {
+                console.log('WARNING! Data present on target range!');
+                console.log('Changing initial block num. Use REWRITE = true to bypass.');
+                starting_block = lastIndexedBlockOnRange;
+            }
+        }
+        console.log('First Block: ' + starting_block);
+        console.log('Last  Block: ' + head);
+    }
+
+    // Setup Readers
+    total_range = head - starting_block;
+    let lastAssignedBlock = starting_block;
+    let activeReadersCount = 0;
+    if (process.env.REPAIR_MODE === 'false') {
+        if (process.env.LIVE_ONLY === 'false') {
+            while (activeReadersCount < max_readers && lastAssignedBlock < head) {
+                worker_index++;
+                const start = lastAssignedBlock;
+                let end = lastAssignedBlock + maxBatchSize;
+                if (end > head) {
+                    end = head;
+                }
+                lastAssignedBlock += maxBatchSize;
+                const def = {
+                    worker_id: worker_index,
+                    worker_role: 'reader',
+                    first_block: start,
+                    last_block: end
+                };
+                // activeReaders.push(def);
+                activeReadersCount++;
+                workerMap.push(def);
+                console.log(`Setting parallel reader [${worker_index}] from block ${start} to ${end}`);
+            }
+        }
+
+        // Setup Serial reader worker
+        if (process.env.LIVE_READER === 'true') {
+            const _head = chain_data['head_block_num'];
+            console.log(`Setting live reader at head = ${_head}`);
+
+            // live block reader
+            worker_index++;
+            workerMap.push({
+                worker_id: worker_index,
+                worker_role: 'continuous_reader',
+                worker_last_processed_block: _head,
+                ws_router: ''
+            });
+
+            // live deserializer
+            worker_index++;
+            workerMap.push({
+                worker_id: worker_index,
+                worker_role: 'deserializer',
+                worker_queue: queue_prefix + ':live_blocks',
+                live_mode: 'true'
+            });
+        }
+    }
+
+    // Setup Deserialization Workers
+    for (let i = 0; i < n_deserializers; i++) {
+        for (let j = 0; j < process.env.DS_MULT; j++) {
+            worker_index++;
+            workerMap.push({
+                worker_id: worker_index,
+                worker_role: 'deserializer',
+                worker_queue: queue_prefix + ':blocks' + ":" + (i + 1),
+                live_mode: 'false'
+            });
+        }
+    }
+
+    // Setup ES Ingestion Workers
+    let qIdx = 0;
+    index_queues.forEach((q) => {
+        let n = n_ingestors_per_queue;
+        if (q.type === 'abi') {
+            n = 1;
+        }
+        qIdx = 0;
+        for (let i = 0; i < n; i++) {
+            let m = 1;
+            if (q.type === 'action' || q.type === 'delta') {
+                m = action_indexing_ratio;
+            }
+            for (let j = 0; j < m; j++) {
+                worker_index++;
+                workerMap.push({
+                    worker_id: worker_index,
+                    worker_role: 'ingestor',
+                    queue: q.name + ":" + (qIdx + 1),
+                    type: q.type
+                });
+                qIdx++;
+            }
+        }
+    });
+
+    // Setup ws router
+    if (process.env.ENABLE_STREAMING === 'true') {
+        worker_index++;
+        workerMap.push({
+            worker_id: worker_index,
+            worker_role: 'router'
+        });
+
+        if (process.env.STREAM_DELTAS === 'true') {
+            console.log('Delta streaming enabled!');
+        }
+        if (process.env.STREAM_TRACES === 'true') {
+            console.log('Action trace streaming enabled!');
+        }
+        if (process.env.STREAM_DELTAS !== 'true' && process.env.STREAM_TRACES !== 'true') {
+            console.log('WARNING! Streaming is enabled without any datatype, please enable STREAM_TRACES and/or STREAM_DELTAS');
+        }
+    }
+
+    // Quit App if on preview mode
+    if (preview) {
+        printWorkerMap(workerMap);
+        await waitForLaunch();
+    }
+
+    // Setup Error Logging
+    setupDSElogs(starting_block, head);
+    await initAbiCacheMap(getAsync);
+
+    // Start Monitoring
+    let log_interval = 5000;
+    let shutdownTimer;
+    const consume_rates = [];
     let pushedBlocks = 0;
     let livePushedBlocks = 0;
     let consumedBlocks = 0;
@@ -196,22 +615,6 @@ async function main() {
     let total_blocks = 0;
     let total_indexed_blocks = 0;
     let total_actions = 0;
-    let total_range = 0;
-    let allowShutdown = false;
-    let allowMoreReaders = true;
-    let maxBatchSize = parseInt(process.env.BATCH_SIZE, 10);
-
-    // Auto-stop
-    let auto_stop = 0;
-    let idle_count = 0;
-    if (process.env.AUTO_STOP) {
-        auto_stop = parseInt(process.env.AUTO_STOP, 10);
-    }
-
-    // Monitoring
-    let log_interval = 5000;
-    let shutdownTimer;
-    const consume_rates = [];
     setInterval(() => {
         const _workers = Object.keys(cluster.workers).length;
         const tScale = (log_interval / 1000);
@@ -241,7 +644,7 @@ async function main() {
         log_msg.push(`D:${deserializedActions / tScale} a/s`);
         log_msg.push(`I:${indexedObjects / tScale} d/s`);
 
-        if (total_blocks < total_range) {
+        if (total_blocks < total_range && process.env.LIVE_ONLY !== 'true') {
             const remaining = total_range - total_blocks;
             const estimated_time = Math.round(remaining / avg_consume_rate);
             const time_string = moment()
@@ -253,10 +656,14 @@ async function main() {
             log_msg.push(`syncs ${time_string} (${pct_parsed}% ${pct_read}%)`);
         }
 
-        console.log(log_msg.join(', '));
+        // print monitoring log
+        if (process.env.NOLOGS !== 'true') {
+            console.log(log_msg.join(', '));
+        }
 
         if (indexedObjects === 0 && deserializedActions === 0 && consumedBlocks === 0) {
 
+            // Allow 10s threshold before shutting down the process
             shutdownTimer = setTimeout(() => {
                 allowShutdown = true;
             }, 10000);
@@ -298,201 +705,10 @@ async function main() {
 
     }, log_interval);
 
-    let lastIndexedBlock;
-    if (process.env.INDEX_DELTAS === 'true') {
-        lastIndexedBlock = await getLastIndexedBlockByDelta(client);
-        console.log('Last indexed block (deltas):', lastIndexedBlock);
-    } else {
-        lastIndexedBlock = await getLastIndexedBlock(client);
-        console.log('Last indexed block (blocks):', lastIndexedBlock);
-    }
-
-    // Start from the last indexed block
-    let starting_block = 1;
-
-    // Fecth chain lib
-    const chain_data = await rpc.get_info();
-    let head = chain_data['head_block_num'];
-
-    if (lastIndexedBlock > 0) {
-        starting_block = lastIndexedBlock;
-    }
-
-    if (process.env.STOP_ON !== "0") {
-        head = parseInt(process.env.STOP_ON, 10);
-    }
-
-    let lastIndexedABI = await getLastIndexedABI(client);
-    console.log(`Last indexed ABI: ${lastIndexedABI}`);
-    if (process.env.ABI_CACHE_MODE === 'true') {
-        starting_block = lastIndexedABI;
-    }
-
-    if (process.env.START_ON !== "0") {
-        starting_block = parseInt(process.env.START_ON, 10);
-        // Check last indexed block again
-        if (process.env.REWRITE !== 'true') {
-            let lastIndexedBlockOnRange;
-            if (process.env.INDEX_DELTAS === 'true') {
-                lastIndexedBlockOnRange = await getLastIndexedBlockByDeltaFromRange(client, starting_block, head);
-            } else {
-                lastIndexedBlockOnRange = await getLastIndexedBlockFromRange(client, starting_block, head);
-            }
-            if (lastIndexedBlockOnRange > starting_block) {
-                console.log('WARNING! Data present on target range!');
-                console.log('Changing initial block num. Use REWRITE = true to bypass.');
-                starting_block = lastIndexedBlockOnRange;
-            }
-        }
-        console.log('FIRST BLOCK: ' + starting_block);
-        console.log('LAST  BLOCK: ' + head);
-    }
-
-    total_range = head - starting_block;
-    // Create first batch of parallel readers
-    let lastAssignedBlock = starting_block;
-    let activeReadersCount = 0;
-
-    if (process.env.REPAIR_MODE === 'false') {
-        if (process.env.LIVE_ONLY === 'false') {
-            while (activeReadersCount < max_readers && lastAssignedBlock < head) {
-                worker_index++;
-                const start = lastAssignedBlock;
-                let end = lastAssignedBlock + maxBatchSize;
-                if (end > head) {
-                    end = head;
-                }
-                lastAssignedBlock += maxBatchSize;
-                const def = {
-                    worker_id: worker_index,
-                    worker_role: 'reader',
-                    first_block: start,
-                    last_block: end
-                };
-                // activeReaders.push(def);
-                activeReadersCount++;
-                workerMap.push(def);
-                console.log(`Launching new reader from ${start} to ${end}`);
-            }
-        }
-
-        // Setup Serial reader worker
-        if (process.env.LIVE_READER === 'true') {
-            const _head = chain_data['head_block_num'];
-            console.log(`Starting live reader at head = ${_head}`);
-
-            // live block reader
-            worker_index++;
-            workerMap.push({
-                worker_id: worker_index,
-                worker_role: 'continuous_reader',
-                worker_last_processed_block: _head,
-                ws_router: ''
-            });
-
-            // live deserializer
-            for (let j = 0; j < process.env.DS_MULT; j++) {
-                worker_index++;
-                workerMap.push({
-                    worker_queue: queue_prefix + ':live_blocks',
-                    worker_id: worker_index,
-                    worker_role: 'deserializer',
-                    live_mode: 'true'
-                });
-            }
-        }
-    }
-
-    // Setup Deserialization Workers
-    for (let i = 0; i < n_deserializers; i++) {
-        for (let j = 0; j < process.env.DS_MULT; j++) {
-            worker_index++;
-            workerMap.push({
-                worker_queue: queue_prefix + ':blocks' + ":" + (i + 1),
-                worker_id: worker_index,
-                worker_role: 'deserializer',
-                live_mode: 'false'
-            });
-        }
-    }
-
-    // Setup ES Ingestion Workers
-    let qIdx = 0;
-    index_queues.forEach((q) => {
-        let n = n_ingestors_per_queue;
-        if (q.type === 'abi') {
-            n = 1;
-        }
-        qIdx = 0;
-        for (let i = 0; i < n; i++) {
-            let m = 1;
-            if (q.type === 'action' || q.type === 'delta') {
-                m = action_indexing_ratio;
-            }
-            for (let j = 0; j < m; j++) {
-                worker_index++;
-                workerMap.push({
-                    worker_id: worker_index,
-                    worker_role: 'ingestor',
-                    type: q.type,
-                    queue: q.name + ":" + (qIdx + 1)
-                });
-                qIdx++;
-            }
-        }
-    });
-
-    // Setup ws router
-    if (process.env.ENABLE_STREAMING === 'true') {
-        worker_index++;
-        workerMap.push({
-            worker_id: worker_index,
-            worker_role: 'router'
-        });
-
-        if (process.env.STREAM_DELTAS === 'true') {
-            console.log('Delta streaming enabled!');
-        }
-        if (process.env.STREAM_TRACES === 'true') {
-            console.log('Action trace streaming enabled!');
-        }
-        if (process.env.STREAM_DELTAS !== 'true' && process.env.STREAM_TRACES !== 'true') {
-            console.log('WARNING! Streaming is enabled without any datatype, please enable STREAM_TRACES and/or STREAM_DELTAS');
-        }
-    }
-
-    // Quit App if on preview mode
-    if (preview) {
-        printWorkerMap(workerMap);
-        process.exit(1);
-    }
-
     // Launch all workers
     workerMap.forEach((conf) => {
         cluster.fork(conf);
     });
-
-    if (!fs.existsSync('./logs')) {
-        fs.mkdirSync('./logs');
-    }
-
-    const dsErrorsLog = './logs/' + process.env.CHAIN + "_ds_err_" + starting_block + "_" + head + "_" + Date.now() + ".txt";
-    if (fs.existsSync(dsErrorsLog)) {
-        fs.unlinkSync(dsErrorsLog);
-    }
-    const ds_errors = fs.createWriteStream(dsErrorsLog, {flags: 'a'});
-    const cachedMap = await getAsync(process.env.CHAIN + ":" + 'abi_cache');
-    let abiCacheMap;
-    if (cachedMap) {
-        abiCacheMap = JSON.parse(cachedMap);
-        console.log(`Found ${Object.keys(abiCacheMap).length} entries in the local ABI cache`)
-    } else {
-        abiCacheMap = {};
-    }
-
-    setInterval(() => {
-        rClient.set(process.env.CHAIN + ":" + 'abi_cache', JSON.stringify(abiCacheMap));
-    }, 10000);
 
     // Worker event listener
     const workerHandler = (msg) => {
@@ -575,7 +791,7 @@ async function main() {
                 // console.log(msg.data);
                 const str = JSON.stringify(msg.data);
                 // console.log(str);
-                ds_errors.write(str + '\n');
+                dsErrorStream.write(str + '\n');
                 break;
             }
             case 'read_block': {
@@ -594,6 +810,7 @@ async function main() {
                     }
                 } else {
                     liveConsumedBlocks++;
+                    onLiveBlock(msg);
                 }
                 break;
             }
@@ -651,6 +868,7 @@ async function main() {
         }, 1000);
     }
 
+    // Attach stop handler
     pm2io.action('stop', (reply) => {
         allowMoreReaders = false;
         console.info('Stop signal received. Shutting down readers immediately!');
